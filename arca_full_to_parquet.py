@@ -107,6 +107,27 @@ RAW_SCHEMA = pa.schema([
     ("row_hash", pa.string()),
 ])
 
+AGGREGATE_SCHEMA = pa.schema([
+    ("periodo", pa.string()),
+    ("anio", pa.int16()),
+    ("mes", pa.int8()),
+    ("tipo", pa.string()),
+    ("fecha", pa.string()),
+    ("aduana", pa.string()),
+    ("ncm", pa.string()),
+    ("pais", pa.string()),
+    ("medio_transporte", pa.string()),
+    ("unidad", pa.string()),
+    ("unidad_nombre", pa.string()),
+    ("peso_neto_kg", pa.float64()),
+    ("monto_fob_usd", pa.float64()),
+    ("cantidad_declaraciones", pa.int64()),
+    ("cantidad_unidad_estadistica", pa.float64()),
+    ("precio_max_usd", pa.float64()),
+    ("precio_min_usd", pa.float64()),
+    ("precio_promedio_usd", pa.float64()),
+])
+
 
 def setup_logging(verbose: bool) -> logging.Logger:
     logging.basicConfig(
@@ -127,6 +148,13 @@ def safe_float(value: object) -> float | None:
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+def safe_int(value: object) -> int | None:
+    number = safe_float(value)
+    if number is None:
+        return None
+    return int(number)
 
 
 def normalize_text(value: str) -> str:
@@ -372,6 +400,169 @@ def detect_layout(header_line: str, logger: logging.Logger) -> Layout:
         field_count=len(headers),
         header_normalized=headers,
     )
+
+
+def detect_source_kind(header_line: str) -> str:
+    headers = [
+        normalize_header(x)
+        for x in header_line.rstrip("\r\n").split("'")
+    ]
+    aggregate_markers = {
+        "PESO_NETO_KILOS",
+        "MONTO_FOB_DOLAR",
+        "CANT_DECLARACIONES",
+        "CANT_UNIDAD_ESTADISTICA",
+    }
+    if aggregate_markers.issubset(set(headers)):
+        return "aggregates"
+    return "items"
+
+
+def inspect_month_source(
+    zip_path: Path,
+    periodo: str,
+) -> tuple[str, str, str]:
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        member = find_impo_member(zf, periodo)
+        with zf.open(member, "r") as source:
+            header_bytes = source.readline()
+            if not header_bytes:
+                raise RuntimeError("Archivo de importaciones vacío")
+            header_line = header_bytes.decode(
+                "latin-1",
+                errors="replace",
+            ).rstrip("\r\n")
+    return detect_source_kind(header_line), header_line, member
+
+
+def parse_aggregate_month(
+    *,
+    periodo: str,
+    zip_path: Path,
+    aggregate_path: Path,
+    logger: logging.Logger,
+) -> tuple[int, str, str]:
+    aggregate_path.parent.mkdir(parents=True, exist_ok=True)
+    total_lines = 0
+    written_rows = 0
+    rows: list[dict] = []
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        member = find_impo_member(zf, periodo)
+        logger.info("Leyendo agregado %s", member)
+
+        with zf.open(member, "r") as source, pq.ParquetWriter(
+            aggregate_path,
+            AGGREGATE_SCHEMA,
+            compression="zstd",
+            use_dictionary=True,
+            write_statistics=True,
+        ) as writer:
+            header_bytes = source.readline()
+            if not header_bytes:
+                raise RuntimeError("Archivo agregado de importaciones vacío")
+
+            header_line = header_bytes.decode(
+                "latin-1",
+                errors="replace",
+            ).rstrip("\r\n")
+            headers = [
+                normalize_header(x)
+                for x in header_line.split("'")
+            ]
+
+            def idx(aliases: set[str], fallback: int) -> int:
+                found = find_index(headers, aliases)
+                return fallback if found is None else found
+
+            indexes = {
+                "tipo": idx({"T", "TIPO"}, 0),
+                "fecha": idx({"FECHA"}, 1),
+                "aduana": idx({"ADU", "ADUANA"}, 2),
+                "ncm": idx({"POS_NCM", "NCM"}, 3),
+                "pais": idx({"PAI", "PAIS"}, 4),
+                "medio": idx({"M", "MEDIO", "MEDIO_TRANSPORTE"}, 5),
+                "unidad": idx({"UN", "UNIDAD"}, 6),
+                "peso": idx({"PESO_NETO_KILOS", "PESO_NETO"}, 7),
+                "fob": idx({"MONTO_FOB_DOLAR", "FOB_DOLAR"}, 8),
+                "declaraciones": idx({"CANT_DECLARACIONES"}, 9),
+                "cantidad_est": idx({"CANT_UNIDAD_ESTADISTICA"}, 10),
+                "precio_max": idx({"PRECIO_MAX"}, 11),
+                "precio_min": idx({"PRECIO_MIN"}, 12),
+                "precio_promedio": idx({"PRECIO_PROMEDIO", "PRECIO_PROM"}, 13),
+            }
+            required_max = max(indexes.values())
+
+            for raw_line in source:
+                total_lines += 1
+                line = raw_line.decode(
+                    "latin-1",
+                    errors="replace",
+                ).rstrip("\r\n")
+                parts = line.split("'")
+                if len(parts) <= required_max:
+                    continue
+
+                ncm = value_at(parts, indexes["ncm"])
+                if not ncm:
+                    continue
+
+                unidad = value_at(parts, indexes["unidad"])
+                rows.append({
+                    "periodo": periodo,
+                    "anio": int(periodo[:4]),
+                    "mes": int(periodo[4:6]),
+                    "tipo": value_at(parts, indexes["tipo"]),
+                    "fecha": value_at(parts, indexes["fecha"]),
+                    "aduana": value_at(parts, indexes["aduana"]),
+                    "ncm": ncm,
+                    "pais": value_at(parts, indexes["pais"]),
+                    "medio_transporte": value_at(parts, indexes["medio"]),
+                    "unidad": unidad,
+                    "unidad_nombre": UNIT_NAMES.get(unidad, "DESCONOCIDA"),
+                    "peso_neto_kg": safe_float(value_at(parts, indexes["peso"])),
+                    "monto_fob_usd": safe_float(value_at(parts, indexes["fob"])),
+                    "cantidad_declaraciones": safe_int(
+                        value_at(parts, indexes["declaraciones"])
+                    ),
+                    "cantidad_unidad_estadistica": safe_float(
+                        value_at(parts, indexes["cantidad_est"])
+                    ),
+                    "precio_max_usd": safe_float(
+                        value_at(parts, indexes["precio_max"])
+                    ),
+                    "precio_min_usd": safe_float(
+                        value_at(parts, indexes["precio_min"])
+                    ),
+                    "precio_promedio_usd": safe_float(
+                        value_at(parts, indexes["precio_promedio"])
+                    ),
+                })
+
+                if len(rows) >= BATCH_SIZE:
+                    table = pa.Table.from_pylist(rows, schema=AGGREGATE_SCHEMA)
+                    writer.write_table(
+                        table,
+                        row_group_size=min(len(rows), BATCH_SIZE),
+                    )
+                    written_rows += len(rows)
+                    rows.clear()
+
+            if rows:
+                table = pa.Table.from_pylist(rows, schema=AGGREGATE_SCHEMA)
+                writer.write_table(
+                    table,
+                    row_group_size=min(len(rows), BATCH_SIZE),
+                )
+                written_rows += len(rows)
+                rows.clear()
+
+    logger.info(
+        "Parseo agregado terminado: %s líneas; %s filas válidas",
+        f"{total_lines:,}",
+        f"{written_rows:,}",
+    )
+    return written_rows, header_line, member
 
 
 class LinkCollector(HTMLParser):
@@ -939,6 +1130,12 @@ def process_period(
         / "items"
         / f"{periodo}.parquet"
     )
+    aggregates_path = (
+        out_dir
+        / "data"
+        / "aggregates"
+        / f"{periodo}.parquet"
+    )
     taxes_path = (
         out_dir
         / "data"
@@ -965,40 +1162,93 @@ def process_period(
         logger,
     )
 
-    raw_rows, header_raw, zip_member = parse_month_to_raw(
-        periodo=periodo,
-        zip_path=zip_path,
-        raw_parquet=raw_parquet,
-        logger=logger,
+    source_kind, inspected_header, inspected_member = inspect_month_source(
+        zip_path,
+        periodo,
     )
+    logger.info("Formato ARCA detectado: %s", source_kind)
 
-    items_count, taxes_count = build_analytical_parquets(
-        raw_parquet=raw_parquet,
-        items_path=items_path,
-        taxes_path=taxes_path if include_taxes else None,
-        logger=logger,
-        include_taxes=include_taxes,
-    )
+    items_count: int | None = None
+    aggregate_count: int | None = None
+    taxes_count: int | None = None
+    header_raw = inspected_header
+    zip_member = inspected_member
+    raw_rows = 0
+
+    if source_kind == "aggregates":
+        aggregate_count, header_raw, zip_member = parse_aggregate_month(
+            periodo=periodo,
+            zip_path=zip_path,
+            aggregate_path=aggregates_path,
+            logger=logger,
+        )
+        raw_rows = aggregate_count
+    else:
+        raw_rows, header_raw, zip_member = parse_month_to_raw(
+            periodo=periodo,
+            zip_path=zip_path,
+            raw_parquet=raw_parquet,
+            logger=logger,
+        )
+
+        items_count, taxes_count = build_analytical_parquets(
+            raw_parquet=raw_parquet,
+            items_path=items_path,
+            taxes_path=taxes_path if include_taxes else None,
+            logger=logger,
+            include_taxes=include_taxes,
+        )
 
     finished = datetime.now(timezone.utc)
+    effective_include_taxes = bool(
+        include_taxes and source_kind == "items"
+    )
 
     manifest = {
         "periodo": periodo,
         "year": int(periodo[:4]),
         "month": int(periodo[4:]),
         "status": "OK",
+        "dataset_kind": source_kind,
         "source_url": source_url,
         "zip_member": zip_member,
         "header_raw": header_raw,
         "raw_valid_rows": raw_rows,
         "unique_items": items_count,
+        "aggregate_rows": aggregate_count,
         "tax_rows": taxes_count,
-        "include_taxes": include_taxes,
+        "include_taxes": effective_include_taxes,
         "zip_bytes": zip_path.stat().st_size,
-        "items_bytes": items_path.stat().st_size,
-        "taxes_bytes": taxes_path.stat().st_size if include_taxes else None,
-        "items_sha256": sha256_file(items_path),
-        "taxes_sha256": sha256_file(taxes_path) if include_taxes else None,
+        "items_bytes": (
+            items_path.stat().st_size
+            if source_kind == "items"
+            else None
+        ),
+        "aggregates_bytes": (
+            aggregates_path.stat().st_size
+            if source_kind == "aggregates"
+            else None
+        ),
+        "taxes_bytes": (
+            taxes_path.stat().st_size
+            if effective_include_taxes
+            else None
+        ),
+        "items_sha256": (
+            sha256_file(items_path)
+            if source_kind == "items"
+            else None
+        ),
+        "aggregates_sha256": (
+            sha256_file(aggregates_path)
+            if source_kind == "aggregates"
+            else None
+        ),
+        "taxes_sha256": (
+            sha256_file(taxes_path)
+            if effective_include_taxes
+            else None
+        ),
         "started_at_utc": started.isoformat(),
         "finished_at_utc": finished.isoformat(),
         "duration_seconds": round(
@@ -1026,7 +1276,6 @@ def process_period(
     logger.info("Manifest: %s", metadata_path)
 
     return manifest
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
