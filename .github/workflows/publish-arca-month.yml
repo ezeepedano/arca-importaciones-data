@@ -70,6 +70,21 @@ jobs:
           echo "HF_DATASET_REPO=$HF_DATASET_REPO" >> "$GITHUB_ENV"
           echo "PERIODO=$PERIOD" >> "$GITHUB_ENV"
 
+      - name: Install Hugging Face CLI
+        shell: bash
+        run: |
+          curl -LsSf https://hf.co/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Hugging Face OIDC and publish metadata
+        env:
+          HF_OIDC_RESOURCE: datasets/${{ env.HF_DATASET_REPO }}
+        shell: bash
+        run: |
+          hf upload "$HF_DATASET_REPO"             dataset_card/README.md             README.md             --repo-type=dataset             --commit-message "Update dataset card"
+
+          hf upload "$HF_DATASET_REPO"             schema.json             schema.json             --repo-type=dataset             --commit-message "Update schema"
+
       - name: Process complete ARCA month
         run: python arca_full_to_parquet.py --periodo "$PERIODO" --out publish
 
@@ -101,21 +116,6 @@ jobs:
           if n_items <= 0:
               raise SystemExit("items vacio")
           PY
-
-      - name: Install Hugging Face CLI
-        shell: bash
-        run: |
-          curl -LsSf https://hf.co/cli/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Publish dataset card and schema
-        env:
-          HF_OIDC_RESOURCE: datasets/${{ env.HF_DATASET_REPO }}
-        shell: bash
-        run: |
-          hf upload "$HF_DATASET_REPO"             dataset_card/README.md             README.md             --repo-type=dataset             --commit-message "Update dataset card"
-
-          hf upload "$HF_DATASET_REPO"             schema.json             schema.json             --repo-type=dataset             --commit-message "Update schema"
 
       - name: Publish processed month
         env:
