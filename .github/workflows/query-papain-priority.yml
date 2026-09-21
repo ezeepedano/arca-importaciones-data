@@ -1,0 +1,25 @@
+name: Priority papain importers
+on:
+  push:
+    branches: [main]
+    paths: [".run/query-papain-priority.json"]
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        periodo: ["202409","202501","202502","202503"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scan raw ARCA
+        run: python3 query_ncm_fast.py --periodo "${{ matrix.periodo }}" --ncm-prefix "35079026" --out "results/${{ matrix.periodo }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: priority-papain-${{ matrix.periodo }}
+          path: results/${{ matrix.periodo }}.json
+          retention-days: 2
