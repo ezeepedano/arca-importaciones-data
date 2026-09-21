@@ -7,6 +7,11 @@ on:
         description: "Mes ARCA en formato YYYYMM"
         required: true
         default: "202608"
+  push:
+    branches:
+      - main
+    paths:
+      - ".run/period.txt"
 
 permissions:
   contents: read
@@ -16,8 +21,6 @@ jobs:
   process-and-publish:
     runs-on: ubuntu-latest
     timeout-minutes: 330
-    env:
-      HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
 
     steps:
       - name: Checkout
@@ -35,21 +38,37 @@ jobs:
       - name: Run regression tests
         run: pytest -q
 
-      - name: Validate inputs
+      - name: Resolve target and period
         shell: bash
         run: |
-          PERIOD="${{ inputs.periodo }}"
+          if [[ ! -s hf_dataset_repo.txt ]]; then
+            echo "Falta hf_dataset_repo.txt con formato usuario/dataset."
+            exit 3
+          fi
+
+          HF_DATASET_REPO="$(tr -d '[:space:]' < hf_dataset_repo.txt)"
+          [[ "$HF_DATASET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo "HF dataset repo invalido: $HF_DATASET_REPO"
+            exit 4
+          }
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            PERIOD="${{ inputs.periodo }}"
+          else
+            if [[ ! -s .run/period.txt ]]; then
+              echo "Falta .run/period.txt"
+              exit 5
+            fi
+            PERIOD="$(tr -d '[:space:]' < .run/period.txt)"
+          fi
+
           [[ "$PERIOD" =~ ^20[0-9]{2}(0[1-9]|1[0-2])$ ]] || {
             echo "Periodo invalido: $PERIOD"
             exit 2
           }
-          echo "PERIODO=$PERIOD" >> "$GITHUB_ENV"
 
-          if [[ -z "$HF_DATASET_REPO" ]]; then
-            echo "Falta la variable HF_DATASET_REPO."
-            echo "Ejemplo: usuario/arca-importaciones-argentina"
-            exit 3
-          fi
+          echo "HF_DATASET_REPO=$HF_DATASET_REPO" >> "$GITHUB_ENV"
+          echo "PERIODO=$PERIOD" >> "$GITHUB_ENV"
 
       - name: Process complete ARCA month
         run: python arca_full_to_parquet.py --periodo "$PERIODO" --out publish
@@ -60,6 +79,7 @@ jobs:
           test -s "publish/data/items/${PERIODO}.parquet"
           test -s "publish/data/taxes/${PERIODO}.parquet"
           test -s "publish/metadata/months/${PERIODO}.json"
+
           python - <<'PY'
           import duckdb
           import os
@@ -90,16 +110,16 @@ jobs:
 
       - name: Publish dataset card and schema
         env:
-          HF_OIDC_RESOURCE: datasets/${{ vars.HF_DATASET_REPO }}
+          HF_OIDC_RESOURCE: datasets/${{ env.HF_DATASET_REPO }}
         shell: bash
         run: |
-          hf upload "$HF_DATASET_REPO" dataset_card/README.md README.md             --repo-type=dataset             --commit-message "Update dataset card"
+          hf upload "$HF_DATASET_REPO"             dataset_card/README.md             README.md             --repo-type=dataset             --commit-message "Update dataset card"
 
-          hf upload "$HF_DATASET_REPO" schema.json schema.json             --repo-type=dataset             --commit-message "Update schema"
+          hf upload "$HF_DATASET_REPO"             schema.json             schema.json             --repo-type=dataset             --commit-message "Update schema"
 
       - name: Publish processed month
         env:
-          HF_OIDC_RESOURCE: datasets/${{ vars.HF_DATASET_REPO }}
+          HF_OIDC_RESOURCE: datasets/${{ env.HF_DATASET_REPO }}
         shell: bash
         run: |
           hf upload "$HF_DATASET_REPO"             "publish/data/items/${PERIODO}.parquet"             "data/items/${PERIODO}.parquet"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: items"
