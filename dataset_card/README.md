@@ -7,6 +7,10 @@ configs:
   data_files:
   - split: train
     path: data/items/*.parquet
+- config_name: aggregates
+  data_files:
+  - split: train
+    path: data/aggregates/*.parquet
 ---
 
 # ARCA Importaciones Argentina
@@ -15,22 +19,23 @@ Dataset público derivado de la **Información Agregada de Comercio Exterior** p
 
 ## Cobertura
 
-El backfill histórico objetivo abarca todos los meses publicados por ARCA desde **02/2017 hasta 08/2026**.
+El objetivo histórico abarca todos los meses publicados por ARCA desde **02/2017 hasta 08/2026**.
 
-## Tabla principal
+## Dos granularidades reales de ARCA
 
-- `items`: un registro único por período + destinación + ítem + NCM. Incluye importador, fecha, aduana, transporte, unidad, cantidad, cantidad convertible a kg, valor del ítem, valor de destinación, país de origen/procedencia, posición declarada cuando está disponible y NCM.
-- `metadata/months/YYYYMM.json`: trazabilidad mensual, conteos, hashes, tamaño y fuente.
+ARCA no mantuvo el mismo formato durante todo el período. El pipeline detecta el encabezado de cada ZIP y conserva la semántica correcta:
 
-La tabla de tributos se omitió deliberadamente del histórico público para mantener el dataset liviano y gratuito. El archivo original de ARCA repite un ítem por cada concepto tributario; el pipeline deduplica esas filas antes de publicar `items`.
+- `data/items/YYYYMM.parquet`: meses con importaciones detalladas por destinación + ítem + NCM. Incluye importador cuando la fuente lo publica.
+- `data/aggregates/YYYYMM.parquet`: meses históricos donde ARCA entrega datos agregados con NCM, país, transporte, unidad, peso neto, FOB, cantidad de declaraciones, cantidad estadística y precios min/max/promedio.
+- `metadata/months/YYYYMM.json`: manifiesto mensual con `dataset_kind`, fuente, conteos, tamaños y hashes.
 
-## Advertencias de agregación
+**No se deben concatenar `items` y `aggregates` suponiendo que tienen la misma granularidad.**
 
-- `valor_item_usd` puede agregarse entre ítems, sujeto a la semántica del archivo fuente.
-- `valor_destinacion_usd` puede repetirse en varios ítems de una misma destinación. **No sumar esa columna entre ítems** para calcular comercio total.
-- `cantidad_kg` solo se calcula cuando la unidad declarada admite una conversión conservadora a kilogramos.
+## Almacenamiento
 
-## Consulta con DuckDB
+La tabla de tributos se omitió deliberadamente del histórico para mantener el dataset liviano. En los archivos detallados, ARCA repite cada ítem por concepto tributario; el pipeline deduplica esas filas antes de publicar `items`.
+
+## Consulta detallada con DuckDB
 
 ```sql
 SELECT importador, SUM(valor_item_usd) AS fob_usd
@@ -40,6 +45,15 @@ GROUP BY importador
 ORDER BY fob_usd DESC;
 ```
 
+## Consulta agregada histórica
+
+```sql
+SELECT ncm, pais, SUM(monto_fob_usd) AS fob_usd
+FROM read_parquet('hf://datasets/alexbozz1/arca-importaciones-argentina/data/aggregates/*.parquet')
+GROUP BY ncm, pais
+ORDER BY fob_usd DESC;
+```
+
 ## Fuente
 
-Los archivos mensuales se descargan desde la publicación oficial de ARCA. El pipeline conserva todos los ítems válidos de importaciones; no filtra por producto ni por empresa.
+Los archivos mensuales se descargan desde la publicación oficial de ARCA. El pipeline no filtra por producto ni por empresa y conserva todos los registros válidos del formato disponible en cada mes.
