@@ -55,3 +55,18 @@ def test_deduplicates_items_but_keeps_taxes(tmp_path: Path):
         "where item='1'"
     ).fetchone()[0]
     assert declared == "290613000000"
+
+    items_only = tmp_path / "items_only.parquet"
+    unused_taxes = tmp_path / "unused_taxes.parquet"
+
+    item_count_only, tax_count_only = build_analytical_parquets(
+        raw_parquet=raw,
+        items_path=items_only,
+        taxes_path=unused_taxes,
+        logger=logger,
+        include_taxes=False,
+    )
+    assert item_count_only == 2
+    assert tax_count_only is None
+    assert items_only.exists()
+    assert not unused_taxes.exists()
