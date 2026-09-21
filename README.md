@@ -13,22 +13,33 @@ Pipeline cloud para convertir los ZIP mensuales públicos de ARCA Argentina en u
 
 ## Primer mes
 
-El workflow viene configurado para probar manualmente `202608` (agosto de 2026).
+El primer objetivo es `202608` (agosto de 2026).
 
-## Configuración única necesaria
+No hace falta configurar una variable de GitHub ni guardar un token de Hugging Face. El workflow lee el destino desde `hf_dataset_repo.txt`.
 
-En GitHub, crear la variable de Actions:
+## Configuración única de Hugging Face
 
-- `HF_DATASET_REPO=TU_USUARIO_HF/arca-importaciones-argentina`
+Crear un dataset público, por ejemplo:
 
-En Hugging Face, dentro del dataset público `TU_USUARIO_HF/arca-importaciones-argentina`, agregar un Trusted Publisher:
+`TU_USUARIO_HF/arca-importaciones-argentina`
+
+Dentro de ese dataset, agregar un Trusted Publisher:
 
 - Provider: GitHub Actions
 - repository: `ezeepedano/arca-importaciones-data`
 - branch: `main`
 - workflow: `publish-arca-month.yml`
 
-El workflow solicita `id-token: write` y usa `HF_OIDC_RESOURCE=datasets/$HF_DATASET_REPO`.
+El workflow solicita `id-token: write` y usa un token OIDC de corta duración.
+
+## Lanzar un mes
+
+1. Guardar el repo de Hugging Face en `hf_dataset_repo.txt`.
+2. Guardar el período en `.run/period.txt`.
+
+Cambiar `.run/period.txt` dispara automáticamente el workflow.
+
+También puede ejecutarse manualmente desde GitHub Actions con `workflow_dispatch`.
 
 ## Ejecución local opcional
 
@@ -39,4 +50,4 @@ python arca_full_to_parquet.py --periodo 202608 --out publish
 
 ## Backfill
 
-Una vez validado el primer mes, ejecutar el workflow por cada período histórico disponible. El proceso es idempotente a nivel de archivo mensual: volver a publicar `YYYYMM` reemplaza ese mes en el dataset.
+Una vez validado el primer mes, se pueden ir cambiando períodos en `.run/period.txt` para publicar cada mes histórico. Volver a publicar un período reemplaza ese mes en el dataset.
