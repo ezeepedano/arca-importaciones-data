@@ -1,4 +1,4 @@
-name: Publish ARCA month to Hugging Face
+name: Publish ARCA to Hugging Face
 
 on:
   workflow_dispatch:
@@ -11,40 +11,29 @@ on:
     branches:
       - main
     paths:
-      - ".run/period.txt"
+      - ".run/request.json"
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  process-and-publish:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 20
+    outputs:
+      periods: ${{ steps.resolve.outputs.periods }}
+      hf_dataset_repo: ${{ steps.resolve.outputs.hf_dataset_repo }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run regression tests
-        run: pytest -q
-
-      - name: Resolve target and period
+      - name: Resolve dataset and periods
+        id: resolve
         shell: bash
         run: |
-          if [[ ! -s hf_dataset_repo.txt ]]; then
-            echo "Falta hf_dataset_repo.txt con formato usuario/dataset."
-            exit 3
-          fi
+          set -euo pipefail
 
           HF_DATASET_REPO="$(tr -d '[:space:]' < hf_dataset_repo.txt)"
           [[ "$HF_DATASET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
@@ -54,21 +43,36 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             PERIOD="${{ inputs.periodo }}"
+            [[ "$PERIOD" =~ ^20[0-9]{2}(0[1-9]|1[0-2])$ ]] || {
+              echo "Periodo invalido: $PERIOD"
+              exit 2
+            }
+            PERIODS="[\"$PERIOD\"]"
           else
-            if [[ ! -s .run/period.txt ]]; then
-              echo "Falta .run/period.txt"
-              exit 5
-            fi
-            PERIOD="$(tr -d '[:space:]' < .run/period.txt)"
+            test -s .run/request.json
+            PERIODS="$(python -c '
+import json
+from pathlib import Path
+p=json.loads(Path(".run/request.json").read_text())
+periods=p.get("periods")
+if not isinstance(periods,list) or not periods:
+    raise SystemExit("request.json debe contener periods no vacio")
+clean=[]
+seen=set()
+for x in periods:
+    s=str(x).strip()
+    if len(s)!=6 or not s.isdigit() or not (1 <= int(s[4:]) <= 12):
+        raise SystemExit(f"periodo invalido: {s}")
+    if s not in seen:
+        clean.append(s); seen.add(s)
+print(json.dumps(clean,separators=(",",":")))
+')"
           fi
 
-          [[ "$PERIOD" =~ ^20[0-9]{2}(0[1-9]|1[0-2])$ ]] || {
-            echo "Periodo invalido: $PERIOD"
-            exit 2
-          }
-
-          echo "HF_DATASET_REPO=$HF_DATASET_REPO" >> "$GITHUB_ENV"
-          echo "PERIODO=$PERIOD" >> "$GITHUB_ENV"
+          echo "hf_dataset_repo=$HF_DATASET_REPO" >> "$GITHUB_OUTPUT"
+          echo "periods=$PERIODS" >> "$GITHUB_OUTPUT"
+          echo "Dataset: $HF_DATASET_REPO"
+          echo "Periodos: $PERIODS"
 
       - name: Install Hugging Face CLI
         shell: bash
@@ -76,54 +80,127 @@ jobs:
           curl -LsSf https://hf.co/cli/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Verify Hugging Face OIDC and publish metadata
+      - name: Publish dataset metadata and remove legacy taxes
         env:
-          HF_OIDC_RESOURCE: datasets/${{ env.HF_DATASET_REPO }}
+          HF_DATASET_REPO: ${{ steps.resolve.outputs.hf_dataset_repo }}
+          HF_OIDC_RESOURCE: datasets/${{ steps.resolve.outputs.hf_dataset_repo }}
         shell: bash
         run: |
-          hf upload "$HF_DATASET_REPO"             dataset_card/README.md             README.md             --repo-type=dataset             --commit-message "Update dataset card"
+          set -euo pipefail
 
-          hf upload "$HF_DATASET_REPO"             schema.json             schema.json             --repo-type=dataset             --commit-message "Update schema"
+          hf upload "$HF_DATASET_REPO"             dataset_card/README.md             README.md             --repo-type=dataset             --commit-message "Update historical dataset card"
 
-      - name: Process complete ARCA month
-        run: python arca_full_to_parquet.py --periodo "$PERIODO" --out publish
+          hf upload "$HF_DATASET_REPO"             schema.json             schema.json             --repo-type=dataset             --commit-message "Update historical schema"
 
-      - name: Verify generated Parquet
+          hf repos delete-files "$HF_DATASET_REPO"             "data/taxes/202608.parquet"             --repo-type=dataset             --commit-message "Remove legacy tax parquet; historical dataset is items-only"             || echo "Legacy tax parquet already absent"
+
+  process-and-publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        periodo: ${{ fromJSON(needs.prepare.outputs.periods) }}
+    env:
+      HF_DATASET_REPO: ${{ needs.prepare.outputs.hf_dataset_repo }}
+      PERIODO: ${{ matrix.periodo }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Skip month already published
         shell: bash
         run: |
+          set -euo pipefail
+          ITEM_URL="https://huggingface.co/datasets/$HF_DATASET_REPO/resolve/main/data/items/$PERIODO.parquet"
+          META_URL="https://huggingface.co/datasets/$HF_DATASET_REPO/resolve/main/metadata/months/$PERIODO.json"
+
+          if curl -fsIL "$ITEM_URL" >/dev/null && curl -fsIL "$META_URL" >/dev/null; then
+            echo "SKIP_MONTH=true" >> "$GITHUB_ENV"
+            echo "$PERIODO ya existe completo en Hugging Face; se omite."
+          else
+            echo "SKIP_MONTH=false" >> "$GITHUB_ENV"
+            echo "$PERIODO necesita procesamiento."
+          fi
+
+      - name: Set up Python
+        if: env.SKIP_MONTH != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        if: env.SKIP_MONTH != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Process ARCA month items-only
+        if: env.SKIP_MONTH != 'true'
+        run: python arca_full_to_parquet.py --periodo "$PERIODO" --out publish --items-only
+
+      - name: Verify generated items and metadata
+        if: env.SKIP_MONTH != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
           test -s "publish/data/items/${PERIODO}.parquet"
-          test -s "publish/data/taxes/${PERIODO}.parquet"
           test -s "publish/metadata/months/${PERIODO}.json"
+          test ! -e "publish/data/taxes/${PERIODO}.parquet"
 
           python - <<'PY'
-          import duckdb
+          import json
           import os
+          from pathlib import Path
+          import duckdb
 
           p = os.environ["PERIODO"]
           items = f"publish/data/items/{p}.parquet"
-          taxes = f"publish/data/taxes/{p}.parquet"
+          meta = json.loads(Path(f"publish/metadata/months/{p}.json").read_text())
 
           n_items = duckdb.sql(
               f"select count(*) from read_parquet('{items}')"
           ).fetchone()[0]
-          n_taxes = duckdb.sql(
-              f"select count(*) from read_parquet('{taxes}')"
-          ).fetchone()[0]
-
-          print("items", n_items)
-          print("taxes", n_taxes)
 
           if n_items <= 0:
               raise SystemExit("items vacio")
+          if meta["unique_items"] != n_items:
+              raise SystemExit("manifest/item count inconsistente")
+          if meta.get("include_taxes") is not False:
+              raise SystemExit("el manifest no esta en modo items-only")
+          if meta.get("taxes_bytes") is not None:
+              raise SystemExit("taxes_bytes debe ser null en items-only")
+
+          print("periodo", p, "items", n_items)
           PY
 
-      - name: Publish processed month
-        env:
-          HF_OIDC_RESOURCE: datasets/${{ env.HF_DATASET_REPO }}
+      - name: Install Hugging Face CLI
+        if: env.SKIP_MONTH != 'true'
         shell: bash
         run: |
+          curl -LsSf https://hf.co/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Publish processed month
+        if: env.SKIP_MONTH != 'true'
+        env:
+          HF_OIDC_RESOURCE: datasets/${{ needs.prepare.outputs.hf_dataset_repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           hf upload "$HF_DATASET_REPO"             "publish/data/items/${PERIODO}.parquet"             "data/items/${PERIODO}.parquet"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: items"
 
-          hf upload "$HF_DATASET_REPO"             "publish/data/taxes/${PERIODO}.parquet"             "data/taxes/${PERIODO}.parquet"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: taxes"
-
           hf upload "$HF_DATASET_REPO"             "publish/metadata/months/${PERIODO}.json"             "metadata/months/${PERIODO}.json"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: metadata"
+
+      - name: Month summary
+        shell: bash
+        run: |
+          if [[ "${SKIP_MONTH:-false}" == "true" ]]; then
+            echo "ARCA $PERIODO: already published"
+          else
+            echo "ARCA $PERIODO: processed and published"
+          fi
