@@ -1,10 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
+  "mode": "items-only",
   "primary_table": "items",
   "items_primary_key": ["periodo", "destinacion", "item", "ncm"],
   "tables": {
     "items": {
-      "description": "Items de importacion deduplicados de las filas tributarias",
+      "description": "Items de importacion deduplicados de las filas tributarias publicadas por ARCA",
       "columns": [
         "periodo", "anio", "mes", "aduana", "destinacion", "item", "fecha",
         "importador", "medio_transporte", "unidad", "unidad_nombre", "cantidad",
@@ -12,15 +13,10 @@
         "usd_por_unidad_declarada", "usd_por_kg", "divisa", "pais_origen",
         "pais_procedencia", "posicion_arancelaria_declarada", "ncm"
       ]
-    },
-    "taxes": {
-      "description": "Conceptos tributarios por item",
-      "columns": [
-        "periodo", "destinacion", "item", "ncm", "concepto", "monto_usd", "row_hash"
-      ]
     }
   },
   "notes": [
+    "El dataset historico publico conserva items + metadata y omite la tabla de tributos para reducir almacenamiento.",
     "valor_destinacion_usd puede repetirse entre items de una misma destinacion y no debe sumarse como FOB por item.",
     "cantidad_kg solo se completa para unidades convertibles conservadoramente a kg."
   ]
