@@ -7,40 +7,39 @@ configs:
   data_files:
   - split: train
     path: data/items/*.parquet
-- config_name: taxes
-  data_files:
-  - split: train
-    path: data/taxes/*.parquet
 ---
 
 # ARCA Importaciones Argentina
 
 Dataset público derivado de la **Información Agregada de Comercio Exterior** publicada por ARCA Argentina.
 
-## Tablas
+## Cobertura
 
-- `items`: un registro único por período + destinación + ítem + NCM. Es la tabla principal para analizar importadores, NCM, cantidades, FOB, países y USD/kg.
-- `taxes`: conceptos/montos tributarios asociados a cada ítem. Se mantiene separada para evitar duplicar FOB o cantidades cuando un ítem tiene varios conceptos.
-- `metadata/months/YYYYMM.json`: trazabilidad mensual, conteos, hashes y fuente.
+El backfill histórico objetivo abarca todos los meses publicados por ARCA desde **02/2017 hasta 08/2026**.
+
+## Tabla principal
+
+- `items`: un registro único por período + destinación + ítem + NCM. Incluye importador, fecha, aduana, transporte, unidad, cantidad, cantidad convertible a kg, valor del ítem, valor de destinación, país de origen/procedencia, posición declarada cuando está disponible y NCM.
+- `metadata/months/YYYYMM.json`: trazabilidad mensual, conteos, hashes, tamaño y fuente.
+
+La tabla de tributos se omitió deliberadamente del histórico público para mantener el dataset liviano y gratuito. El archivo original de ARCA repite un ítem por cada concepto tributario; el pipeline deduplica esas filas antes de publicar `items`.
 
 ## Advertencias de agregación
 
-- `valor_item_usd` es el valor del ítem y sí puede agregarse entre ítems, sujeto a la semántica del archivo fuente.
+- `valor_item_usd` puede agregarse entre ítems, sujeto a la semántica del archivo fuente.
 - `valor_destinacion_usd` puede repetirse en varios ítems de una misma destinación. **No sumar esa columna entre ítems** para calcular comercio total.
-- `cantidad_kg` solo se calcula cuando la unidad declarada admite una conversión conservadora a kilogramos. No se convierten litros, unidades, packs ni kg bruto a kg neto.
+- `cantidad_kg` solo se calcula cuando la unidad declarada admite una conversión conservadora a kilogramos.
 
 ## Consulta con DuckDB
 
 ```sql
 SELECT importador, SUM(valor_item_usd) AS fob_usd
-FROM read_parquet('hf://datasets/USUARIO/arca-importaciones-argentina/data/items/*.parquet')
+FROM read_parquet('hf://datasets/alexbozz1/arca-importaciones-argentina/data/items/*.parquet')
 WHERE ncm LIKE '2906.13%'
 GROUP BY importador
 ORDER BY fob_usd DESC;
 ```
 
-## Fuente y alcance
+## Fuente
 
-Los archivos se descargan de la publicación oficial ARCA/AFIP. El pipeline conserva todos los ítems válidos del archivo mensual de importaciones y no filtra por producto.
-
-El nombre del proveedor/exportador extranjero no necesariamente forma parte de esta fuente pública. El dataset no infiere proveedores.
+Los archivos mensuales se descargan desde la publicación oficial de ARCA. El pipeline conserva todos los ítems válidos de importaciones; no filtra por producto ni por empresa.
