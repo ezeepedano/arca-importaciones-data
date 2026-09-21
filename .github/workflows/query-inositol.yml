@@ -1,0 +1,148 @@
+name: Query inositol imports 2022-2026
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".run/query-inositol.json"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      periods: ${{ steps.periods.outputs.periods }}
+      ncm: ${{ steps.periods.outputs.ncm }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: periods
+        shell: bash
+        run: |
+          set -euo pipefail
+          NCM="$(jq -r '.ncm_prefix // "290613"' .run/query-inositol.json)"
+          PERIODS="$(jq -c '.periods' .run/query-inositol.json)"
+          echo "ncm=$NCM" >> "$GITHUB_OUTPUT"
+          echo "periods=$PERIODS" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        periodo: ${{ fromJSON(needs.prepare.outputs.periods) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Scan NCM
+        run: |
+          python query_ncm_month.py             --periodo "${{ matrix.periodo }}"             --ncm-prefix "${{ needs.prepare.outputs.ncm }}"             --out "results/${{ matrix.periodo }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ncm-${{ matrix.periodo }}
+          path: results/${{ matrix.periodo }}.json
+          retention-days: 3
+
+  consolidate:
+    needs: [prepare, scan]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ncm-*
+          path: all-results
+          merge-multiple: true
+      - name: Consolidate
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, glob, json
+          from collections import defaultdict
+          from pathlib import Path
+
+          files=glob.glob("all-results/*.json")
+          rows=[]
+          months_ok=[]
+          for f in files:
+              d=json.load(open(f,encoding="utf-8"))
+              months_ok.append(d["periodo"])
+              rows.extend(d["matches"])
+
+          by=defaultdict(lambda:{
+              "items":0,"fob_usd":0.0,"kg":0.0,"kg_rows":0,
+              "years":set(),"origins":set(),"declared_positions":set()
+          })
+          for r in rows:
+              name=(r.get("importador") or "").strip() or "(sin nombre)"
+              x=by[name]
+              x["items"]+=1
+              x["fob_usd"]+=float(r.get("valor_item_usd") or 0)
+              if r.get("cantidad_kg") is not None:
+                  x["kg"]+=float(r["cantidad_kg"])
+                  x["kg_rows"]+=1
+              x["years"].add(r["periodo"][:4])
+              if r.get("pais_origen"): x["origins"].add(r["pais_origen"])
+              if r.get("posicion_arancelaria_declarada"):
+                  x["declared_positions"].add(r["posicion_arancelaria_declarada"])
+
+          summary=[]
+          for name,x in by.items():
+              summary.append({
+                  "importador":name,
+                  "items":x["items"],
+                  "fob_usd":round(x["fob_usd"],2),
+                  "cantidad_kg_sum":round(x["kg"],6),
+                  "kg_rows":x["kg_rows"],
+                  "years":sorted(x["years"]),
+                  "pais_origen_codigos":sorted(x["origins"]),
+                  "posiciones_declaradas":sorted(x["declared_positions"]),
+              })
+          summary.sort(key=lambda x:(-x["fob_usd"],-x["items"],x["importador"]))
+
+          out={
+              "months_requested":56,
+              "months_completed":len(set(months_ok)),
+              "months":sorted(set(months_ok)),
+              "matching_items":len(rows),
+              "importers":summary,
+              "rows":rows,
+          }
+          Path("inositol_2022_2026.json").write_text(
+              json.dumps(out,ensure_ascii=False,indent=2),encoding="utf-8"
+          )
+          with open("inositol_importers_2022_2026.csv","w",newline="",encoding="utf-8-sig") as fh:
+              w=csv.DictWriter(fh,fieldnames=[
+                  "importador","items","fob_usd","cantidad_kg_sum","kg_rows",
+                  "years","pais_origen_codigos","posiciones_declaradas"
+              ])
+              w.writeheader()
+              for x in summary:
+                  y=x.copy()
+                  for k in ("years","pais_origen_codigos","posiciones_declaradas"):
+                      y[k]=";".join(y[k])
+                  w.writerow(y)
+
+          print("=== QUERY SUMMARY ===")
+          print("months_completed",len(set(months_ok)))
+          print("matching_items",len(rows))
+          print("importers",len(summary))
+          print("=== TOP IMPORTERS ===")
+          for x in summary[:50]:
+              print(json.dumps(x,ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inositol-2022-2026-results
+          path: |
+            inositol_2022_2026.json
+            inositol_importers_2022_2026.csv
+          retention-days: 7
