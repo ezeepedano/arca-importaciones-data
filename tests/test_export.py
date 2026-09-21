@@ -4,7 +4,7 @@ from pathlib import Path
 
 import duckdb
 
-from arca_full_to_parquet import parse_month_to_raw, build_analytical_parquets
+from arca_full_to_parquet import (\n    parse_month_to_raw,\n    build_analytical_parquets,\n    parse_aggregate_month,\n    detect_source_kind,\n)
 
 
 def test_deduplicates_items_but_keeps_taxes(tmp_path: Path):
@@ -70,3 +70,45 @@ def test_deduplicates_items_but_keeps_taxes(tmp_path: Path):
     assert tax_count_only is None
     assert items_only.exists()
     assert not unused_taxes.exists()
+
+
+def test_historical_aggregate_layout(tmp_path: Path):
+    periodo = "201702"
+    z = tmp_path / f"{periodo}.zip"
+    header = (
+        "T'FECHA'ADU'POS_NCM'PAI'M'UN'PESO_NETO_KILOS'"
+        "MONTO_FOB_DOLAR'CANT_DECLARACIONES'CANT_UNIDAD_ESTADISTICA'"
+        "PRECIO_MAX'PRECIO_MIN'PRECIO_PROMEDIO\n"
+    )
+    rows = [
+        "I'20170201'001'21069090'156'4'01'100'2500'2'100'30'20'25\n",
+        "I'20170202'002'29061300'032'1'01'50'1200'1'50'24'24'24\n",
+    ]
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("impo_agregado_2017_02.lst", header + "".join(rows))
+
+    assert detect_source_kind(header) == "aggregates"
+
+    out = tmp_path / "aggregates.parquet"
+    logger = logging.getLogger("test-aggregate")
+    count, parsed_header, member = parse_aggregate_month(
+        periodo=periodo,
+        zip_path=z,
+        aggregate_path=out,
+        logger=logger,
+    )
+
+    assert count == 2
+    assert "PESO_NETO_KILOS" in parsed_header
+    assert member == "impo_agregado_2017_02.lst"
+
+    result = duckdb.sql(
+        f"""
+        select
+            sum(peso_neto_kg),
+            sum(monto_fob_usd),
+            sum(cantidad_declaraciones)
+        from read_parquet('{out}')
+        """
+    ).fetchone()
+    assert result == (150.0, 3700.0, 3)
