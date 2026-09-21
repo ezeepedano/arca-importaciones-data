@@ -1,0 +1,87 @@
+name: Fast query papain imports 2022-2026
+on:
+  push:
+    branches: [main]
+    paths: [".run/query-papain-fast.json"]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      periods: ${{ steps.x.outputs.periods }}
+      ncm: ${{ steps.x.outputs.ncm }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: x
+        run: |
+          echo "periods=$(jq -c '.periods' .run/query-papain-fast.json)" >> "$GITHUB_OUTPUT"
+          echo "ncm=$(jq -r '.ncm_prefix' .run/query-papain-fast.json)" >> "$GITHUB_OUTPUT"
+  scan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        periodo: ${{ fromJSON(needs.prepare.outputs.periods) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scan raw ARCA
+        run: python3 query_ncm_fast.py --periodo "${{ matrix.periodo }}" --ncm-prefix "${{ needs.prepare.outputs.ncm }}" --out "results/${{ matrix.periodo }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-papain-${{ matrix.periodo }}
+          path: results/${{ matrix.periodo }}.json
+          retention-days: 2
+  consolidate:
+    needs: [prepare,scan]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fast-papain-*
+          path: all
+          merge-multiple: true
+      - name: Consolidate
+        run: |
+          python3 - <<'PY'
+          import csv,glob,json
+          from collections import defaultdict
+          from pathlib import Path
+          rows=[]; months=[]
+          for f in glob.glob("all/*.json"):
+              d=json.load(open(f,encoding="utf-8"));months.append(d["periodo"]);rows+=d["matches"]
+          by=defaultdict(lambda:{"items":0,"fob_usd":0.0,"kg":0.0,"kg_rows":0,"months":set(),"origins":set(),"procedences":set()})
+          for r in rows:
+              n=(r.get("importador") or "").strip() or "(sin nombre)"
+              x=by[n];x["items"]+=1;x["fob_usd"]+=float(r.get("valor_item_usd") or 0);x["months"].add(r["periodo"])
+              if r.get("pais_origen"):x["origins"].add(r["pais_origen"])
+              if r.get("pais_procedencia"):x["procedences"].add(r["pais_procedencia"])
+              if r.get("cantidad_kg") is not None:x["kg"]+=float(r["cantidad_kg"]);x["kg_rows"]+=1
+          imps=[]
+          for n,x in by.items():
+              imps.append({"importador":n,"items":x["items"],"fob_usd":round(x["fob_usd"],2),
+              "cantidad_kg_sum":round(x["kg"],6),"kg_rows":x["kg_rows"],"months":sorted(x["months"]),
+              "pais_origen_codigos":sorted(x["origins"]),"pais_procedencia_codigos":sorted(x["procedences"])})
+          imps.sort(key=lambda x:(-x["items"],-x["fob_usd"],x["importador"]))
+          out={"ncm_prefix":"35079026","months_completed":len(set(months)),"months":sorted(set(months)),
+               "matching_items":len(rows),"importers":imps,"rows":rows}
+          Path("papain_2022_2026_fast.json").write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding="utf-8")
+          with open("papain_importers_2022_2026_fast.csv","w",newline="",encoding="utf-8-sig") as fh:
+              fields=["importador","items","fob_usd","cantidad_kg_sum","kg_rows","months","pais_origen_codigos","pais_procedencia_codigos"]
+              w=csv.DictWriter(fh,fieldnames=fields);w.writeheader()
+              for x in imps:
+                  y=x.copy();y["months"]=";".join(y["months"]);y["pais_origen_codigos"]=";".join(y["pais_origen_codigos"]);y["pais_procedencia_codigos"]=";".join(y["pais_procedencia_codigos"]);w.writerow(y)
+          print("MONTHS",len(set(months)),"ITEMS",len(rows),"IMPORTERS",len(imps))
+          for x in imps[:100]:print(json.dumps(x,ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: papain-fast-final
+          path: |
+            papain_2022_2026_fast.json
+            papain_importers_2022_2026_fast.csv
+          retention-days: 7
