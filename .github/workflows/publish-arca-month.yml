@@ -68,8 +68,6 @@ jobs:
 
           echo "hf_dataset_repo=$HF_DATASET_REPO" >> "$GITHUB_OUTPUT"
           echo "periods=$PERIODS" >> "$GITHUB_OUTPUT"
-          echo "Dataset: $HF_DATASET_REPO"
-          echo "Periodos: $PERIODS"
 
       - name: Install Hugging Face CLI
         shell: bash
@@ -89,7 +87,7 @@ jobs:
 
           hf upload "$HF_DATASET_REPO"             schema.json             schema.json             --repo-type=dataset             --commit-message "Update historical schema"
 
-          hf repos delete-files "$HF_DATASET_REPO"             "data/taxes/202608.parquet"             --repo-type=dataset             --commit-message "Remove legacy tax parquet; historical dataset is items-only"             || echo "Legacy tax parquet already absent"
+          hf repos delete-files "$HF_DATASET_REPO"             "data/taxes/202608.parquet"             --repo-type=dataset             --commit-message "Remove legacy tax parquet; historical dataset is lean"             || echo "Legacy tax parquet already absent"
 
   process-and-publish:
     needs: prepare
@@ -112,10 +110,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ITEM_URL="https://huggingface.co/datasets/$HF_DATASET_REPO/resolve/main/data/items/$PERIODO.parquet"
-          META_URL="https://huggingface.co/datasets/$HF_DATASET_REPO/resolve/main/metadata/months/$PERIODO.json"
 
-          if curl -fsIL "$ITEM_URL" >/dev/null && curl -fsIL "$META_URL" >/dev/null; then
+          BASE="https://huggingface.co/datasets/$HF_DATASET_REPO/resolve/main"
+          META_URL="$BASE/metadata/months/$PERIODO.json"
+          ITEM_URL="$BASE/data/items/$PERIODO.parquet"
+          AGG_URL="$BASE/data/aggregates/$PERIODO.parquet"
+
+          HAS_META=false
+          HAS_DATA=false
+
+          curl -fsIL "$META_URL" >/dev/null && HAS_META=true || true
+          if curl -fsIL "$ITEM_URL" >/dev/null; then
+            HAS_DATA=true
+          elif curl -fsIL "$AGG_URL" >/dev/null; then
+            HAS_DATA=true
+          fi
+
+          if [[ "$HAS_META" == "true" && "$HAS_DATA" == "true" ]]; then
             echo "SKIP_MONTH=true" >> "$GITHUB_ENV"
             echo "$PERIODO ya existe completo en Hugging Face; se omite."
           else
@@ -134,19 +145,16 @@ jobs:
         if: env.SKIP_MONTH != 'true'
         run: pip install -r requirements.txt
 
-      - name: Process ARCA month items-only
+      - name: Process ARCA month
         if: env.SKIP_MONTH != 'true'
         run: python arca_full_to_parquet.py --periodo "$PERIODO" --out publish --items-only
 
-      - name: Verify generated items and metadata
+      - name: Verify generated dataset
         if: env.SKIP_MONTH != 'true'
         shell: bash
         run: |
           set -euo pipefail
-
-          test -s "publish/data/items/${PERIODO}.parquet"
           test -s "publish/metadata/months/${PERIODO}.json"
-          test ! -e "publish/data/taxes/${PERIODO}.parquet"
 
           python - <<'PY'
           import json
@@ -155,24 +163,47 @@ jobs:
           import duckdb
 
           p = os.environ["PERIODO"]
-          items = f"publish/data/items/{p}.parquet"
           meta = json.loads(Path(f"publish/metadata/months/{p}.json").read_text())
+          kind = meta.get("dataset_kind")
 
-          n_items = duckdb.sql(
-              f"select count(*) from read_parquet('{items}')"
-          ).fetchone()[0]
-
-          if n_items <= 0:
-              raise SystemExit("items vacio")
-          if meta["unique_items"] != n_items:
-              raise SystemExit("manifest/item count inconsistente")
           if meta.get("include_taxes") is not False:
-              raise SystemExit("el manifest no esta en modo items-only")
+              raise SystemExit("el manifest no esta en modo lean/items-only")
           if meta.get("taxes_bytes") is not None:
-              raise SystemExit("taxes_bytes debe ser null en items-only")
+              raise SystemExit("taxes_bytes debe ser null")
 
-          print("periodo", p, "items", n_items)
+          if kind == "items":
+              path = Path(f"publish/data/items/{p}.parquet")
+              if not path.is_file() or path.stat().st_size <= 0:
+                  raise SystemExit("items parquet faltante")
+              count = duckdb.sql(
+                  f"select count(*) from read_parquet('{path}')"
+              ).fetchone()[0]
+              if meta.get("unique_items") != count:
+                  raise SystemExit("manifest/item count inconsistente")
+              if Path(f"publish/data/aggregates/{p}.parquet").exists():
+                  raise SystemExit("no debe existir aggregate parquet para items")
+          elif kind == "aggregates":
+              path = Path(f"publish/data/aggregates/{p}.parquet")
+              if not path.is_file() or path.stat().st_size <= 0:
+                  raise SystemExit("aggregate parquet faltante")
+              count = duckdb.sql(
+                  f"select count(*) from read_parquet('{path}')"
+              ).fetchone()[0]
+              if meta.get("aggregate_rows") != count:
+                  raise SystemExit("manifest/aggregate count inconsistente")
+              if Path(f"publish/data/items/{p}.parquet").exists():
+                  raise SystemExit("no debe existir items parquet para agregado")
+          else:
+              raise SystemExit(f"dataset_kind desconocido: {kind}")
+
+          if count <= 0:
+              raise SystemExit("dataset mensual vacio")
+
+          Path(".dataset_kind").write_text(kind)
+          print("periodo", p, "kind", kind, "rows", count)
           PY
+
+          echo "DATASET_KIND=$(cat .dataset_kind)" >> "$GITHUB_ENV"
 
       - name: Install Hugging Face CLI
         if: env.SKIP_MONTH != 'true'
@@ -189,7 +220,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          hf upload "$HF_DATASET_REPO"             "publish/data/items/${PERIODO}.parquet"             "data/items/${PERIODO}.parquet"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: items"
+          if [[ "$DATASET_KIND" == "items" ]]; then
+            hf upload "$HF_DATASET_REPO"               "publish/data/items/${PERIODO}.parquet"               "data/items/${PERIODO}.parquet"               --repo-type=dataset               --commit-message "ARCA ${PERIODO}: detailed items"
+          elif [[ "$DATASET_KIND" == "aggregates" ]]; then
+            hf upload "$HF_DATASET_REPO"               "publish/data/aggregates/${PERIODO}.parquet"               "data/aggregates/${PERIODO}.parquet"               --repo-type=dataset               --commit-message "ARCA ${PERIODO}: aggregate imports"
+          else
+            echo "DATASET_KIND invalido: $DATASET_KIND"
+            exit 6
+          fi
 
           hf upload "$HF_DATASET_REPO"             "publish/metadata/months/${PERIODO}.json"             "metadata/months/${PERIODO}.json"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: metadata"
 
@@ -199,5 +237,5 @@ jobs:
           if [[ "${SKIP_MONTH:-false}" == "true" ]]; then
             echo "ARCA $PERIODO: already published"
           else
-            echo "ARCA $PERIODO: processed and published"
+            echo "ARCA $PERIODO: $DATASET_KIND processed and published"
           fi
