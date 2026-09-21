@@ -1,0 +1,108 @@
+name: Publish ARCA month to Hugging Face
+
+on:
+  workflow_dispatch:
+    inputs:
+      periodo:
+        description: "Mes ARCA en formato YYYYMM"
+        required: true
+        default: "202608"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  process-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      HF_DATASET_REPO: ${{ vars.HF_DATASET_REPO }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run regression tests
+        run: pytest -q
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          PERIOD="${{ inputs.periodo }}"
+          [[ "$PERIOD" =~ ^20[0-9]{2}(0[1-9]|1[0-2])$ ]] || {
+            echo "Periodo invalido: $PERIOD"
+            exit 2
+          }
+          echo "PERIODO=$PERIOD" >> "$GITHUB_ENV"
+
+          if [[ -z "$HF_DATASET_REPO" ]]; then
+            echo "Falta la variable HF_DATASET_REPO."
+            echo "Ejemplo: usuario/arca-importaciones-argentina"
+            exit 3
+          fi
+
+      - name: Process complete ARCA month
+        run: python arca_full_to_parquet.py --periodo "$PERIODO" --out publish
+
+      - name: Verify generated Parquet
+        shell: bash
+        run: |
+          test -s "publish/data/items/${PERIODO}.parquet"
+          test -s "publish/data/taxes/${PERIODO}.parquet"
+          test -s "publish/metadata/months/${PERIODO}.json"
+          python - <<'PY'
+          import duckdb
+          import os
+
+          p = os.environ["PERIODO"]
+          items = f"publish/data/items/{p}.parquet"
+          taxes = f"publish/data/taxes/{p}.parquet"
+
+          n_items = duckdb.sql(
+              f"select count(*) from read_parquet('{items}')"
+          ).fetchone()[0]
+          n_taxes = duckdb.sql(
+              f"select count(*) from read_parquet('{taxes}')"
+          ).fetchone()[0]
+
+          print("items", n_items)
+          print("taxes", n_taxes)
+
+          if n_items <= 0:
+              raise SystemExit("items vacio")
+          PY
+
+      - name: Install Hugging Face CLI
+        shell: bash
+        run: |
+          curl -LsSf https://hf.co/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Publish dataset card and schema
+        env:
+          HF_OIDC_RESOURCE: datasets/${{ vars.HF_DATASET_REPO }}
+        shell: bash
+        run: |
+          hf upload "$HF_DATASET_REPO" dataset_card/README.md README.md             --repo-type=dataset             --commit-message "Update dataset card"
+          hf upload "$HF_DATASET_REPO" schema.json schema.json             --repo-type=dataset             --commit-message "Update schema"
+
+      - name: Publish processed month
+        env:
+          HF_OIDC_RESOURCE: datasets/${{ vars.HF_DATASET_REPO }}
+        shell: bash
+        run: |
+          hf upload "$HF_DATASET_REPO"             "publish/data/items/${PERIODO}.parquet"             "data/items/${PERIODO}.parquet"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: items"
+
+          hf upload "$HF_DATASET_REPO"             "publish/data/taxes/${PERIODO}.parquet"             "data/taxes/${PERIODO}.parquet"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: taxes"
+
+          hf upload "$HF_DATASET_REPO"             "publish/metadata/months/${PERIODO}.json"             "metadata/months/${PERIODO}.json"             --repo-type=dataset             --commit-message "ARCA ${PERIODO}: metadata"
