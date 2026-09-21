@@ -1,11 +1,10 @@
 {
-  "version": 2,
-  "mode": "items-only",
-  "primary_table": "items",
-  "items_primary_key": ["periodo", "destinacion", "item", "ncm"],
+  "version": 3,
+  "mode": "lean-historical",
   "tables": {
     "items": {
-      "description": "Items de importacion deduplicados de las filas tributarias publicadas por ARCA",
+      "granularity": "destinacion-item-ncm",
+      "description": "Importaciones detalladas deduplicadas de las filas tributarias",
       "columns": [
         "periodo", "anio", "mes", "aduana", "destinacion", "item", "fecha",
         "importador", "medio_transporte", "unidad", "unidad_nombre", "cantidad",
@@ -13,11 +12,23 @@
         "usd_por_unidad_declarada", "usd_por_kg", "divisa", "pais_origen",
         "pais_procedencia", "posicion_arancelaria_declarada", "ncm"
       ]
+    },
+    "aggregates": {
+      "granularity": "agregado-arca",
+      "description": "Meses históricos en los que ARCA publica solamente información agregada",
+      "columns": [
+        "periodo", "anio", "mes", "tipo", "fecha", "aduana", "ncm", "pais",
+        "medio_transporte", "unidad", "unidad_nombre", "peso_neto_kg",
+        "monto_fob_usd", "cantidad_declaraciones",
+        "cantidad_unidad_estadistica", "precio_max_usd", "precio_min_usd",
+        "precio_promedio_usd"
+      ]
     }
   },
   "notes": [
-    "El dataset historico publico conserva items + metadata y omite la tabla de tributos para reducir almacenamiento.",
-    "valor_destinacion_usd puede repetirse entre items de una misma destinacion y no debe sumarse como FOB por item.",
-    "cantidad_kg solo se completa para unidades convertibles conservadoramente a kg."
+    "Cada mes se publica en items o aggregates según el formato real del archivo fuente de ARCA.",
+    "No deben unirse items y aggregates como si tuvieran la misma granularidad.",
+    "La tabla de tributos se omite del histórico para reducir almacenamiento.",
+    "valor_destinacion_usd puede repetirse entre items de una misma destinacion y no debe sumarse como FOB por item."
   ]
 }
