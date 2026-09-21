@@ -4,7 +4,12 @@ from pathlib import Path
 
 import duckdb
 
-from arca_full_to_parquet import (\n    parse_month_to_raw,\n    build_analytical_parquets,\n    parse_aggregate_month,\n    detect_source_kind,\n)
+from arca_full_to_parquet import (
+    parse_month_to_raw,
+    build_analytical_parquets,
+    parse_aggregate_month,
+    detect_source_kind,
+)
 
 
 def test_deduplicates_items_but_keeps_taxes(tmp_path: Path):
