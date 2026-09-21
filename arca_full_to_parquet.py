@@ -796,11 +796,15 @@ def build_analytical_parquets(
     *,
     raw_parquet: Path,
     items_path: Path,
-    taxes_path: Path,
+    taxes_path: Path | None,
     logger: logging.Logger,
-) -> tuple[int, int]:
+    include_taxes: bool = True,
+) -> tuple[int, int | None]:
     items_path.parent.mkdir(parents=True, exist_ok=True)
-    taxes_path.parent.mkdir(parents=True, exist_ok=True)
+    if include_taxes:
+        if taxes_path is None:
+            raise ValueError("taxes_path es obligatorio cuando include_taxes=True")
+        taxes_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = duckdb.connect(database=":memory:")
 
@@ -812,7 +816,6 @@ def build_analytical_parquets(
 
         raw = str(raw_parquet).replace("'", "''")
         items = str(items_path).replace("'", "''")
-        taxes = str(taxes_path).replace("'", "''")
 
         connection.execute(f"""
             COPY (
@@ -856,44 +859,55 @@ def build_analytical_parquets(
             )
         """)
 
-        connection.execute(f"""
-            COPY (
-                SELECT DISTINCT
-                    periodo,
-                    destinacion,
-                    item,
-                    ncm,
-                    concepto,
-                    monto_usd,
-                    row_hash
-                FROM read_parquet('{raw}')
-                WHERE concepto <> '' OR monto_usd IS NOT NULL
-            )
-            TO '{taxes}' (
-                FORMAT PARQUET,
-                COMPRESSION ZSTD,
-                ROW_GROUP_SIZE 100000
-            )
-        """)
-
         items_count = connection.execute(
             f"SELECT count(*) FROM read_parquet('{items}')"
         ).fetchone()[0]
 
-        taxes_count = connection.execute(
-            f"SELECT count(*) FROM read_parquet('{taxes}')"
-        ).fetchone()[0]
+        taxes_count: int | None = None
+        if include_taxes:
+            taxes = str(taxes_path).replace("'", "''")
+            connection.execute(f"""
+                COPY (
+                    SELECT DISTINCT
+                        periodo,
+                        destinacion,
+                        item,
+                        ncm,
+                        concepto,
+                        monto_usd,
+                        row_hash
+                    FROM read_parquet('{raw}')
+                    WHERE concepto <> '' OR monto_usd IS NOT NULL
+                )
+                TO '{taxes}' (
+                    FORMAT PARQUET,
+                    COMPRESSION ZSTD,
+                    ROW_GROUP_SIZE 100000
+                )
+            """)
+
+            taxes_count = int(
+                connection.execute(
+                    f"SELECT count(*) FROM read_parquet('{taxes}')"
+                ).fetchone()[0]
+            )
 
     finally:
         connection.close()
 
-    logger.info(
-        "Parquet final: %s ítems únicos; %s filas tributarias",
-        f"{items_count:,}",
-        f"{taxes_count:,}",
-    )
+    if include_taxes:
+        logger.info(
+            "Parquet final: %s ítems únicos; %s filas tributarias",
+            f"{items_count:,}",
+            f"{taxes_count:,}",
+        )
+    else:
+        logger.info(
+            "Parquet final items-only: %s ítems únicos",
+            f"{items_count:,}",
+        )
 
-    return int(items_count), int(taxes_count)
+    return int(items_count), taxes_count
 
 
 def process_period(
@@ -901,6 +915,7 @@ def process_period(
     out_dir: Path,
     keep_zip: bool,
     verbose: bool,
+    include_taxes: bool = True,
 ) -> dict:
     if (
         len(periodo) != 6
@@ -960,8 +975,9 @@ def process_period(
     items_count, taxes_count = build_analytical_parquets(
         raw_parquet=raw_parquet,
         items_path=items_path,
-        taxes_path=taxes_path,
+        taxes_path=taxes_path if include_taxes else None,
         logger=logger,
+        include_taxes=include_taxes,
     )
 
     finished = datetime.now(timezone.utc)
@@ -977,11 +993,12 @@ def process_period(
         "raw_valid_rows": raw_rows,
         "unique_items": items_count,
         "tax_rows": taxes_count,
+        "include_taxes": include_taxes,
         "zip_bytes": zip_path.stat().st_size,
         "items_bytes": items_path.stat().st_size,
-        "taxes_bytes": taxes_path.stat().st_size,
+        "taxes_bytes": taxes_path.stat().st_size if include_taxes else None,
         "items_sha256": sha256_file(items_path),
-        "taxes_sha256": sha256_file(taxes_path),
+        "taxes_sha256": sha256_file(taxes_path) if include_taxes else None,
         "started_at_utc": started.isoformat(),
         "finished_at_utc": finished.isoformat(),
         "duration_seconds": round(
@@ -1031,6 +1048,11 @@ def parse_args() -> argparse.Namespace:
         help="Conservar ZIP tras convertir",
     )
     parser.add_argument(
+        "--items-only",
+        action="store_true",
+        help="Generar solo items + metadata; omite el Parquet de tributos",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
     )
@@ -1045,6 +1067,7 @@ def main() -> int:
         Path(args.out),
         args.keep_zip,
         args.verbose,
+        include_taxes=not args.items_only,
     )
 
     print(
